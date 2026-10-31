@@ -1,171 +1,188 @@
 import asyncio
+import hashlib
+import io
 import os
-import queue
-import sys
-import numpy as np
-import sounddevice as sd
-import streamlit as st
-from dotenv import load_dotenv, find_dotenv
+import wave
 
-# Ensure layout config is first
-st.set_page_config(
-    page_title="VibeVoyage AI | Voice Assistant",
-    page_icon="✈️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+import numpy as np
+import streamlit as st
+from agents import Agent
+from agents.voice import (
+    AudioInput,
+    SingleAgentVoiceWorkflow,
+    TTSModelSettings,
+    VoicePipeline,
+    VoicePipelineConfig,
 )
 
-# Load environment variables
-load_dotenv(find_dotenv(), override=True)
-
-try:
-    from agents import Agent
-    from agents.voice import (
-        AudioInput,
-        SingleAgentVoiceWorkflow,
-        TTSModelSettings,
-        VoicePipeline,
-        VoicePipelineConfig,
-    )
-except ImportError:
-    st.error("❌ Critical components from the `agents` library are missing! Please check installation.")
-
-# Constants
 SAMPLE_RATE = 24_000
 
-# Initialize Session State Variables
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "is_recording" not in st.session_state:
-    st.session_state.is_recording = False
-if "agent_status" not in st.session_state:
-    st.session_state.agent_status = "Ready to assist"
+st.set_page_config(page_title="Travel Voice Agent", page_icon="🎙️")
+st.title("🎙️ Travel Advisor Voice Agent")
+st.write("Record a question and receive a spoken travel-advice response.")
 
-# Setup the backend Voice Pipeline
-@st.cache_resource
-def get_voice_pipeline():
+
+def get_api_key():
+    try:
+        key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        key = ""
+    return key or os.getenv("OPENAI_API_KEY")
+
+
+def decode_wav(wav_bytes):
+    """Decode microphone WAV data into mono int16 audio at 24 kHz."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            channels = wav_file.getnchannels()
+            width = wav_file.getsampwidth()
+            source_rate = wav_file.getframerate()
+            frames = wav_file.readframes(wav_file.getnframes())
+
+        if width != 2:
+            raise ValueError("Expected 16-bit PCM microphone audio.")
+        audio = np.frombuffer(frames, dtype="<i2")
+        if channels > 1:
+            audio = audio.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        if audio.size == 0:
+            raise ValueError("The recording is empty.")
+
+        if source_rate != SAMPLE_RATE:
+            new_size = max(1, round(len(audio) * SAMPLE_RATE / source_rate))
+            audio = np.interp(
+                np.linspace(0, len(audio) - 1, new_size),
+                np.arange(len(audio)),
+                audio,
+            ).astype(np.int16)
+
+        return np.ascontiguousarray(audio, dtype=np.int16)
+    except wave.Error as exc:
+        raise ValueError("The microphone recording could not be decoded as WAV.") from exc
+
+
+def make_pipeline(voice):
     agent = Agent(
         name="Travel Advisor",
         instructions=(
-            "You are a friendly, enthusiastic, and knowledgeable travel advisor. "
-            "Keep spoken answers short, completely natural, and highly engaging. "
-            "Keep responses to a strict limit of 2-3 sentences maximum."
+            "You are a friendly, knowledgeable travel advisor. Help users plan trips, "
+            "compare destinations, and create practical itineraries. Ask a brief "
+            "follow-up if essential details are missing. Keep spoken replies natural "
+            "and concise, usually 2–4 sentences. Never invent live prices, visa rules, "
+            "opening hours, or availability; say when details need verification."
         ),
         model="gpt-4o-mini",
     )
     return VoicePipeline(
         workflow=SingleAgentVoiceWorkflow(agent),
         config=VoicePipelineConfig(
-            tts_settings=TTSModelSettings(voice="coral"),
+            tts_settings=TTSModelSettings(voice=voice),
             trace_include_sensitive_audio_data=False,
         ),
     )
 
-try:
-    pipeline = get_voice_pipeline()
-except Exception as e:
-    st.sidebar.error(f"Error configuring pipeline: {e}")
 
-# Title Section
-st.title("✈️ VibeVoyage AI")
-st.subheader("Your Intelligent Agentic Voice Companion")
-st.markdown("---")
+async def process_voice_turn(audio_array, voice):
+    pipeline = make_pipeline(voice)
+    audio_input = AudioInput(
+        buffer=audio_array,
+        frame_rate=SAMPLE_RATE,
+        sample_width=2,
+        channels=1,
+    )
+    result = await pipeline.run(audio_input)
 
-# Layout Configuration
-col_control, col_display = st.columns([1, 2], gap="large")
+    chunks = []
+    async for event in result.stream():
+        if event.type == "voice_stream_event_audio":
+            chunks.append(np.asarray(event.data).copy())
 
-with col_control:
-    st.header("🎛️ Voice Control Panel")
-    st.info("💡 Click **Start Recording**, speak your travel question clearly, and click **Stop & Process** when you're finished.")
-    
-    # State-driven interactive loop button actions
-    if not st.session_state.is_recording:
-        if st.button("🎙️ Start Recording", type="primary", use_container_width=True):
-            st.session_state.is_recording = True
-            st.session_state.agent_status = "🔴 Recording microphone input..."
-            st.session_state.chunks = []
-            
-            # Start background non-blocking audio stream
-            def callback(indata, frames, time, status):
-                if st.session_state.is_recording:
-                    st.session_state.chunks.append(indata.copy())
-                    
-            st.session_state.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, 
-                channels=1, 
-                dtype="int16", 
-                callback=callback
-            )
-            st.session_state.stream.start()
-            st.rerun()
+    if not chunks:
+        raise RuntimeError("The agent did not return any audio.")
+    output = np.concatenate(chunks)
+    if output.dtype == np.float32:
+        output = (np.clip(output, -1, 1) * 32767).astype(np.int16)
     else:
-        if st.button("🛑 Stop & Process", type="secondary", use_container_width=True):
-            st.session_state.is_recording = False
-            st.session_state.agent_status = "🧠 Agentic AI processing audio..."
-            st.rerun()
+        output = output.astype(np.int16, copy=False)
+    return result.total_output_text, output
 
-    # Status Monitor
-    st.metric(label="System Status", value=st.session_state.agent_status)
-    
-    # Audio Processing & Execution Loop
-    if not st.session_state.is_recording and hasattr(st.session_state, "chunks") and len(st.session_state.chunks) > 0:
-        with st.spinner("Processing voice request and synthesizing response stream..."):
+
+def to_wav_bytes(audio):
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(np.asarray(audio, dtype="<i2").tobytes())
+    return buffer.getvalue()
+
+
+api_key = get_api_key()
+if not api_key:
+    st.warning(
+        'Set OPENAI_API_KEY in Streamlit Cloud → App settings → Secrets, for example: '
+        'OPENAI_API_KEY = "your-api-key". Locally, set it as an environment variable.'
+    )
+    st.stop()
+
+os.environ["OPENAI_API_KEY"] = api_key
+
+with st.sidebar:
+    st.subheader("Voice settings")
+    voice = st.selectbox(
+        "Assistant voice",
+        ["coral", "marin", "cedar", "alloy", "ash", "ballad", "echo",
+         "fable", "nova", "onyx", "sage", "shimmer", "verse"],
+        index=0,
+    )
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["text"])
+        if message.get("audio"):
+            st.audio(message["audio"], format="audio/wav")
+
+recording = st.audio_input("Record your travel question", sample_rate=SAMPLE_RATE)
+
+if recording is not None:
+    raw_audio = recording.getvalue()
+    recording_id = hashlib.sha256(raw_audio).hexdigest()
+
+    if st.session_state.get("processed_recording") != recording_id:
+        if st.button("Send to Travel Advisor", type="primary"):
             try:
-                # Stop existing hardware audio input streams safely
-                if hasattr(st.session_state, "stream"):
-                    st.session_state.stream.stop()
-                    st.session_state.stream.close()
-                
-                # Reconstruct and validate vector shape properties for AudioInput
-                audio_array = np.concatenate(st.session_state.chunks, axis=0).flatten()
-                audio_input = AudioInput(buffer=audio_array)
-                st.session_state.chunks = [] # Clear immediately to reset context
-                
-                # Execute Pipeline asynchronously
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(pipeline.run(audio_input))
-                
-                # Local variables to track final text output elements
-                generated_text = result.total_output_text if hasattr(result, 'total_output_text') else ""
-                
-                # Process structural playback buffer events
-                audio_chunks = []
-                async def collect_stream():
-                    async for event in result.stream():
-                        if event.type == "voice_stream_event_audio":
-                            audio_chunks.append(event.data)
-                loop.run_until_complete(collect_stream())
-                
-                # Streamlit clean native audio component player rendering
-                if audio_chunks:
-                    full_audio_bytes = b"".join(audio_chunks)
-                    st.audio(full_audio_bytes, format="audio/wav", autoplay=True)
-                    st.success("🔊 Playing back personalized response!")
-                
-                # Persist conversational chat nodes in application session states
-                st.session_state.chat_history.append({"role": "user", "text": "🎤 [Voice Request]"})
-                st.session_state.chat_history.append({"role": "assistant", "text": generated_text})
-                st.session_state.agent_status = "Ready to assist"
+                st.session_state.processed_recording = recording_id
+                with st.spinner("The agent is listening and preparing your answer..."):
+                    audio_array = decode_wav(raw_audio)
+                    answer, spoken_audio = asyncio.run(
+                        process_voice_turn(audio_array, voice)
+                    )
+                    answer_wav = to_wav_bytes(spoken_audio)
+
+                st.session_state.messages.append(
+                    {"role": "user", "text": "🎤 Voice question"}
+                )
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "text": answer or "I could not generate a text answer.",
+                        "audio": answer_wav,
+                    }
+                )
                 st.rerun()
-                
-            except Exception as ex:
-                st.error(f"Pipeline processing failed: {ex}")
-                st.session_state.agent_status = "Error state"
+            except Exception as exc:
+                st.error(f"Voice agent error: {exc}")
+                st.info("Check your API key, network connection, and installed dependencies.")
 
-with col_display:
-    st.header("💬 Conversation Transcript")
-    
-    # Render updated interaction loops chronologically
-    if not st.session_state.chat_history:
-        st.write("*No conversation history yet. Start recording to consult your advisor.*")
-    else:
-        for index, message in enumerate(st.session_state.chat_history):
-            if message["role"] == "user":
-                st.chat_message("user").write(message["text"])
-            else:
-                st.chat_message("assistant").write(message["text"])
+if st.session_state.messages and st.button("Clear conversation"):
+    st.session_state.messages = []
+    st.session_state.pop("processed_recording", None)
+    st.rerun()
 
-    if st.button("🗑️ Clear Chat Sessions", use_container_width=True):
-        st.session_state.chat_history = []
-        st.rerun()
+st.divider()
+st.caption(
+    "Audio is sent to OpenAI for transcription and response generation. "
+    "Do not record passwords, payment details, or other sensitive information."
+)
